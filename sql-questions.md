@@ -42,6 +42,27 @@ These functions allow you to calculate rankings or running totals without collap
 - **RANK()**: Gives the same rank to ties, but skips the next numbers. `(1, 1, 3, 4)`. Notice how rank `2` is skipped!
 - **DENSE_RANK()**: Gives the same rank to ties, but does *not* skip numbers. `(1, 1, 2, 3)`.
 
+**Query Demonstration**:
+```sql
+SELECT 
+    student_name, 
+    exam_score,
+    -- Strictly gives every row a unique number (1, 2, 3, 4)
+    ROW_NUMBER() OVER (ORDER BY exam_score DESC) as row_num,
+    
+    -- Ties get the same rank, but skips the next number (1, 1, 3)
+    RANK() OVER (ORDER BY exam_score DESC) as rank_val,
+    
+    -- Ties get the same rank, firmly does NOT skip numbers (1, 1, 2)
+    DENSE_RANK() OVER (ORDER BY exam_score DESC) as dense_rank_val
+FROM students;
+```
+
+**Time Complexity and Indexing Impacts**:
+- **Computational Time Complexity**: Running a window function generally results in an **$O(N \log N)$** time cost. This is because the `OVER (ORDER BY ...)` clause brutally forces the database engine to perform a full internal sorting algorithm on the dataset *before* it can physically assign the ranks.
+- **How Indexes drop the complexity**: If you already have a persistent physical **Index** perfectly matching the exact column you are sorting by (e.g., an index physically placed on `exam_score`), the database brilliantly **skips** the $O(N \log N)$ sorting step entirely! It just linearly reads the data straight off the pre-sorted B-Tree index, instantly dropping the window function's computational overhead down to **$O(N)$**.
+- **Structural Effect**: Window functions strictly operate in RAM on the final result set. They have absolutely zero structural effect on the underlying tables or existing indexes, and the database does not permanently save/index the dynamically calculated ranks.
+
 ## Subqueries vs Joins
 - **Subquery**: A query nested inside another query. 
   - *Pros*: Very easy to read and intuitive to write.

@@ -286,3 +286,214 @@ In Java, both interfaces are explicitly used for sorting collections (like an `A
   - *Modern Example*: `Comparator<Employee> bySalary = (e1, e2) -> Double.compare(e1.getSalary(), e2.getSalary());`
 - **When to use**: When you desperately need total dynamic flexibility. You can freely create 10 distinct `Comparator` objects (Sort by Age, Sort by Name, Sort by Start Date) without ever modifying the original `Employee` class source code.
 - **Critical Logic Principle**: You **must** universally use a `Comparator` when you explicitly need to sort third-party classes generated from an external `.jar` file, precisely because you physically cannot edit their class files to add a `Comparable` interface!
+
+
+## thenApply vs thenCombine vs thenCompose vs thenAccept
+These are all chaining methods on **`CompletableFuture`** (Java 8+), used to build asynchronous pipelines. The key difference is *what they do with the result* of the previous stage:
+
+### `thenApply()` — Transform the result
+- **What it does**: Takes the result of the previous future, applies a function to it, and returns a **new** `CompletableFuture` with the transformed value. Think of it like `Stream.map()`.
+- **When to use**: When you want to transform the value from Step A directly into a new value for Step B.
+```java
+CompletableFuture.supplyAsync(() -> "hello")
+    .thenApply(s -> s.toUpperCase())   // transforms "hello" → "HELLO"
+    .thenApply(s -> s + "!")           // transforms "HELLO" → "HELLO!"
+    .thenAccept(System.out::println);  // prints "HELLO!"
+```
+
+### `thenCompose()` — Chain dependent futures (FlatMap)
+- **What it does**: Used specifically when Step B is itself an **async function** that returns its own `CompletableFuture`. Without `thenCompose`, you'd end up with an ugly nested `CompletableFuture<CompletableFuture<User>>` that needs manual unwrapping. `thenCompose` automatically flattens it into `CompletableFuture<User>`.
+- **When to use**: When each step **depends on** the result of the previous step AND is itself a non-blocking async call.
+
+**Step 1 — Define the two async helper methods:**
+```java
+// Simulates a non-blocking DB call to fetch a user's ID
+static CompletableFuture<Integer> fetchUserId(String username) {
+    return CompletableFuture.supplyAsync(() -> {
+        System.out.println("Fetching ID for: " + username);
+        return 42; // pretend this came from DB
+    });
+}
+
+// Simulates a non-blocking DB call that NEEDS the ID from the previous step
+static CompletableFuture<String> fetchUserDetails(int userId) {
+    return CompletableFuture.supplyAsync(() -> {
+        System.out.println("Fetching details for userId: " + userId);
+        return "User{id=42, name='Alice', role='Admin'}"; // pretend this came from DB
+    });
+}
+```
+
+**Step 2 — Chain them using `thenCompose`:**
+```java
+CompletableFuture<String> result = fetchUserId("alice")      // Step A: CompletableFuture<Integer>
+    .thenCompose(id -> fetchUserDetails(id));                 // Step B: CompletableFuture<String> (flattened automatically)
+
+result.thenAccept(System.out::println);
+// Output:
+// Fetching ID for: alice
+// Fetching details for userId: 42
+// User{id=42, name='Alice', role='Admin'}
+```
+
+**What would happen with `thenApply` instead?**
+```java
+// ❌ WRONG — produces CompletableFuture<CompletableFuture<String>> — a nested future you can't easily use
+CompletableFuture<CompletableFuture<String>> nested = fetchUserId("alice")
+    .thenApply(id -> fetchUserDetails(id));  // fetchUserDetails returns CF<String>, so thenApply wraps it again!
+```
+
+**What if you call `thenCompose` on a `CompletableFuture<Void>`?**
+- `CompletableFuture<Void>` has no result value to pass forward (it's the return type of `thenAccept` and `runAsync`). 
+-  If you chain `thenCompose` on it, your lambda receives `null` as the input. This is valid but only useful if your next step is a fire-and-forget action that doesn't need the previous result.
+```java
+CompletableFuture.runAsync(() -> System.out.println("Step A (no result)"))
+    .thenCompose(voidResult -> CompletableFuture.runAsync(() -> System.out.println("Step B (voidResult is null)")));
+```
+> *In practice, chaining async work off a `Void` future should use `thenRun()` instead — it is cleaner as it explicitly signals "I expect no input from the previous step."*
+
+**What if you call `thenCompose` on a `CompletableFuture<Integer>`?**
+- This is the normal, intended usage. `thenCompose` receives the `Integer` result from the upstream future and passes it as the argument into your lambda. Your lambda **must** return a new `CompletableFuture<T>` (of any type), which is then flattened.
+```java
+CompletableFuture<Integer> step1 = CompletableFuture.supplyAsync(() -> 5);  // produces an Integer
+
+CompletableFuture<String> step2 = step1.thenCompose(number -> {
+    // 'number' here is the Integer 5, passed directly from step1
+    return CompletableFuture.supplyAsync(() -> "The number doubled is: " + (number * 2));
+});
+
+step2.thenAccept(System.out::println);
+// Output: The number doubled is: 10
+```
+- **Key point**: The `Integer` value flows naturally into the lambda as the typed argument. `thenCompose` unwraps the `CompletableFuture<Integer>`, hands you the raw `5`, and expects you to return a new `CompletableFuture` from your lambda in return. The final result is a clean, single `CompletableFuture<String>` — not a nested one.
+
+> *In summary — `thenCompose` on a `CompletableFuture<T>` where `T` is a real value (like `Integer`, `String`, `User`) is the standard correct use case. The `Void` variant is the edge case where you're essentially signalling "I don't care about the previous result, just run this next."*
+
+### `thenCombine()` — Merge two **independent** futures
+- **What it does**: Runs two completely independent `CompletableFuture`s in parallel and combines their results once **both** complete.
+- **When to use**: When Step A and Step B have no dependency on each other but you need both results together to continue.
+```java
+CompletableFuture<String> userFuture   = CompletableFuture.supplyAsync(() -> fetchUser());
+CompletableFuture<String> priceFuture  = CompletableFuture.supplyAsync(() -> fetchPrice());
+
+userFuture.thenCombine(priceFuture, (user, price) -> user + " owes: " + price)
+          .thenAccept(System.out::println);
+```
+
+### `thenAccept()` — Consume the result (no return)
+- **What it does**: Takes the result of the previous future and runs a side-effect action (like logging, writing to DB, printing). Returns `CompletableFuture<Void>` — it is a terminal operation in the chain.
+- **When to use**: At the **end** of your pipeline when you want to do something with the final value but don't need to pass anything further.
+```java
+CompletableFuture.supplyAsync(() -> "Final Result")
+    .thenAccept(result -> System.out.println("Got: " + result)); // terminal, returns void
+```
+
+### Quick Reference Summary
+
+| Method | Input | Output | Use When |
+|---|---|---|---|
+| `thenApply` | `T` | `CompletableFuture<U>` | Transform a value (like map) |
+| `thenCompose` | `T` | `CompletableFuture<U>` (flattened) | Chain dependent async calls (like flatMap) |
+| `thenCombine` | `T` + `U` (parallel) | `CompletableFuture<V>` | Merge two independent futures |
+| `thenAccept` | `T` | `CompletableFuture<Void>` | Terminal — consume result, no return |
+
+
+## map vs flatMap
+
+### `map()` — One-to-One transformation
+- **What it does**: Applies a function to each element and wraps every single result into its own individual slot in the output Stream. The structure is **preserved** — one input element always produces exactly one output element.
+- **Result**: `Stream<Stream<T>>` if your mapping function returns a collection (a nested stream!).
+
+```java
+List<String> words = List.of("Hello", "World");
+
+// map → each word is split into a Stream<String[]>
+words.stream()
+     .map(word -> word.split(""))     // produces Stream<String[]> — a stream of ARRAYS
+     .forEach(System.out::println);   // prints array references, not individual letters!
+```
+
+### `flatMap()` — One-to-Many, then Flatten
+- **What it does**: Applies a function to each element (like `map`), but then **flattens** all inner Streams into a single, continuous output Stream. You go from `Stream<Stream<T>>` → `Stream<T>`.
+- **Mental model**: "Map, then squash everything into one flat layer."
+
+```java
+List<String> words = List.of("Hello", "World");
+
+// flatMap → each word is split AND the inner arrays are merged into one flat Stream
+words.stream()
+     .flatMap(word -> Arrays.stream(word.split(""))) // flattens into Stream<String>
+     .forEach(System.out::print);                    // prints: HelloWorld
+```
+
+### What happens when you run `flatMap` on a 1D array (already flat)?
+- `flatMap` strictly expects your mapping function to return a `Stream`. If you apply it on a flat/1D collection where each element maps to a **single-element stream**, it simply behaves identically to `map()` — no real flattening occurs because there is no nesting to collapse.
+
+```java
+List<Integer> numbers = List.of(1, 2, 3, 4);
+
+// flatMap on a 1D list where mapper returns a single-element stream
+numbers.stream()
+       .flatMap(n -> Stream.of(n * 2))  // each element maps to Stream.of(one value)
+       .forEach(System.out::print);     // prints: 2 4 6 8 — same as map(n -> n * 2)
+```
+> *The key takeaway: `flatMap` is only meaningfully different from `map` when each element produces a **multi-element stream** (like splitting a sentence into words, or a user into their list of orders). On a truly 1D flat structure with a single-value mapper, it is functionally equivalent to `map`.*
+
+### Quick Comparison
+
+| | `map` | `flatMap` |
+|---|---|---|
+| **Transformation** | 1 input → 1 output | 1 input → N outputs (flattened) |
+| **Return type of mapper** | Any value `U` | `Stream<U>` |
+| **Output Stream type** | `Stream<U>` | `Stream<U>` (flattened) |
+| **Common use case** | Transforming values | Splitting/expanding nested structures |
+
+## HashMap vs ConcurrentHashMap
+
+### `HashMap`
+- **Thread Safety**: Completely **not thread-safe**. If two threads simultaneously call `put()` on the same `HashMap`, they can corrupt its internal structure (infinite loops in Java 7 due to circular linked list during rehashing, or lost updates in Java 8+).
+- **Null handling**: Allows **one `null` key** and **multiple `null` values**.
+- **Performance**: Fastest in single-threaded contexts — zero locking overhead.
+- **When to use**: Only in single-threaded code, or when you manage external synchronization yourself.
+
+### `ConcurrentHashMap`
+- **Thread Safety**: Fully thread-safe **without** locking the entire map. This is the key insight — it uses fine-grained locking so multiple threads can read and write simultaneously without blocking each other.
+- **Null handling**: Does **NOT** allow `null` keys or `null` values. This is intentional — in a concurrent context, a `get()` returning `null` is ambiguous: does the key not exist, or was `null` explicitly stored? Disallowing it removes the ambiguity.
+- **When to use**: Any shared, multi-threaded environment (caches, shared registries, etc.).
+
+### How ConcurrentHashMap achieves thread safety internally
+
+**Java 7 — Segment Locking:**
+- The map was divided into fixed **Segments** (default: 16). Each segment was an independently locked mini-HashMap.
+- Only the specific segment being written to was locked — other segments remained fully accessible.
+- Max concurrency = number of segments (16 by default).
+
+**Java 8+ — Node-level (CAS) Locking:**
+- Segments were completely removed. Instead, locking happens at the individual **bucket/node level** using **Compare-And-Swap (CAS)** for lock-free reads and only locking a single bucket's head node for writes.
+- This enables far greater concurrency — thousands of threads can write to different buckets simultaneously with no contention.
+
+  **How CAS actually works (it's not a version — it's a value check):**
+  - CAS is a single, atomic CPU-level instruction. It operates on three things: a **memory address**, the **expected current value**, and the **new value** you want to write.
+  - The logic is: *"Only update this memory slot to the new value IF its current value still matches what I expect. If something else already changed it, do nothing and tell me it failed."*
+  - In pseudocode:
+    ```
+    CAS(memoryAddress, expectedValue, newValue):
+        if (*memoryAddress == expectedValue):
+            *memoryAddress = newValue   // success — atomic swap
+            return true
+        else:
+            return false                // someone already changed it, retry
+    ```
+  - In `ConcurrentHashMap`, when a thread wants to **insert into an empty bucket**, it reads the current head node (expected = `null`), and does a CAS: *"Set this bucket's head to my new node, only if it's still `null`."* If another thread already inserted something there, CAS returns `false` and the thread retries.
+  - **Key difference from version-based locking (like Optimistic Locking in DB)**: Database Optimistic Locking attaches a version *number* to a row and increments it on each write. CAS directly compares the raw *value in memory* — no separate version counter needed. It's faster because it's a single atomic CPU instruction, not a DB round-trip.
+
+### Quick Comparison
+
+| Feature | `HashMap` | `ConcurrentHashMap` |
+|---|---|---|
+| **Thread-safe?** | ❌ No | ✅ Yes |
+| **Locking** | None | Per-node (Java 8+) |
+| **Null keys/values** | 1 null key, many null values | ❌ Neither allowed |
+| **Performance (single-thread)** | Faster | Slight overhead |
+| **Performance (multi-thread)** | Dangerous / broken | High concurrency |
+| **Use case** | Single-threaded | Shared multi-threaded maps |

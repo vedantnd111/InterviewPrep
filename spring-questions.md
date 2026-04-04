@@ -56,6 +56,7 @@ When you trigger `SpringApplication.run()`:
 7. **Runners Execution**: Executes any beans implementing `CommandLineRunner` or `ApplicationRunner`.
 
 ## Internals of @Transactional and pitfalls
+- https://www.marcobehler.com/guides/spring-transaction-management-transactional-in-depth
 **How it works internally:**
 Spring implements this using **AOP (Aspect-Oriented Programming) Proxies**. When you invoke a `@Transactional` method, you do not talk to your actual target class directly; you talk to a Spring-generated "Proxy" class holding it.
 
@@ -123,3 +124,36 @@ Designing for high traffic requires overcoming severe bottleneck issues and maki
 4. **Database Connection Pooling & Replication**: Standardize DB connections universally using HikariCP. Split the database into a Master (for writes) and multiple Read-Replicas (for reads) to distribute the load perfectly.
 5. **Circuit Breakers for Resilience**: Apply **Resilience4J**. 
    - *Logic*: If an external microservice you depend on temporarily goes down, fail fast! Never let 10,000 internal threads hang unresponsively waiting for an external timeout, as that instantly cascades and destroys your own application.
+
+
+## @Configruation vs @Component
+
+- @Configuration
+    - Defining @Bean methods
+    - Need singleton consistency
+    - Writing config classes
+    - @Configuration → proxy subclass → method interception
+    - Spring creates a CGLIB proxy of AppConfig class (in below example)
+    - Calls to b() are intercepted
+    - @Configuration(proxyBeanMethods = false) can stop proxying of beans
+```
+@Configuration
+public class AppConfig {
+
+    @Bean
+    public B b() {
+        return new B();
+    }
+
+    @Bean
+    public A a() {
+        return new A(b());
+    }
+}
+```
+
+- @Component
+    - Regular beans
+    - No @Bean methods involved
+    - @Service, @Repository, @Controller are subtypes of @Component.
+    - @Component → plain object → direct method calls
